@@ -7,6 +7,7 @@ interface ActiveToken {
   token: string;
   expiresAt: number;
   consumed: boolean;
+  signedInnerRequired: boolean;
 }
 
 /** Encapsulates the single active QR token. One instance per Pi process. */
@@ -22,11 +23,24 @@ export class QRSession {
    * Issues a new active token, invalidating any previous one.
    * Returns the token and its expiry timestamp.
    */
-  issueToken(): { token: string; expiresAt: number } {
+  issueToken(options: { signedInnerRequired?: boolean } = {}): { token: string; expiresAt: number } {
     const token = this.generateToken();
     const expiresAt = Date.now() + TOKEN_TTL_MS;
-    this.active = { token, expiresAt, consumed: false };
+    this.active = {
+      token,
+      expiresAt,
+      consumed: false,
+      signedInnerRequired: options.signedInnerRequired ?? true,
+    };
     return { token, expiresAt };
+  }
+
+  requiresSignedInner(token: string): boolean {
+    return !!this.active &&
+      this.active.token === token &&
+      !this.active.consumed &&
+      Date.now() <= this.active.expiresAt &&
+      this.active.signedInnerRequired;
   }
 
   /** Validates and atomically consumes a token. */
@@ -75,6 +89,10 @@ export function buildQRUri(
     n: sessionName.slice(0, 80),
   });
   if (roomId) params.set("rm", roomId);
+  // Capability advertised in QR so a relay cannot silently strip the
+  // pair_request capability and downgrade a new app/Pi pair to unsigned
+  // inner traffic. Legacy QRs omit this and remain compatible.
+  params.set("si", "1");
   return `remotepi://pair?${params.toString()}`;
 }
 

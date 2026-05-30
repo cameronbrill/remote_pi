@@ -42,19 +42,21 @@ vi.mock("./transport/relay_client.js", () => ({
 
 // ── Mock storage ──────────────────────────────────────────────────────────────
 
-type StoredPeer = { name: string; remote_epk: string; paired_at: string };
+type StoredPeer = { name: string; remote_epk: string; paired_at: string; supports_signed_inner_v1?: boolean };
+type TestEd25519Keypair = { publicKey: Uint8Array; secretKey: Uint8Array };
 const _knownPeers: StoredPeer[] = [];
 const _addedPeers: StoredPeer[] = [];
 const _removedPeers: string[] = [];
+let _piKeypair: TestEd25519Keypair = {
+  publicKey: new Uint8Array(32),
+  secretKey: new Uint8Array(32),
+};
 
 vi.mock("./pairing/storage.js", async (importOriginal) => {
   const orig = await importOriginal<typeof import("./pairing/storage.js")>();
   return {
     ...orig,
-    getOrCreateEd25519Keypair: vi.fn().mockResolvedValue({
-      publicKey: new Uint8Array(32),
-      secretKey: new Uint8Array(32),
-    }),
+    getOrCreateEd25519Keypair: vi.fn().mockImplementation(async () => _piKeypair),
     listPeers: vi.fn().mockImplementation(async () => [..._knownPeers]),
     addPeer: vi.fn().mockImplementation(async (p: StoredPeer) => {
       _addedPeers.push(p);
@@ -106,6 +108,7 @@ vi.mock("./config.js", async (importOriginal) => {
 // ── Mock qrSession.consumeToken control ───────────────────────────────────────
 
 let _tokenStatus: "ok" | "expired" | "consumed" | "unknown" = "ok";
+let _tokenRequiresSignedInner = false;
 const _consumeCalls: string[] = [];
 
 vi.mock("./pairing/qr.js", async (importOriginal) => {
@@ -122,6 +125,7 @@ vi.mock("./pairing/qr.js", async (importOriginal) => {
         _consumeCalls.push(token);
         return _tokenStatus;
       }),
+      requiresSignedInner: vi.fn().mockImplementation(() => _tokenRequiresSignedInner),
       clear: vi.fn(),
       generateToken: vi.fn().mockReturnValue("test-token"),
     },
@@ -261,14 +265,20 @@ describe("state machine + pair_request flow", () => {
     _removedPeers.length = 0;
     _consumeCalls.length = 0;
     _tokenStatus = "ok";
+    _tokenRequiresSignedInner = false;
     relayRef.current = null;
-    // Restore default consumeToken behavior — earlier tests can override it.
+    const crypto = await import("./pairing/crypto.js");
+    _piKeypair = crypto.generateEd25519Keypair();
+    // Restore default token behavior — earlier tests can override it.
     const qr = await import("./pairing/qr.js");
     (qr.qrSession.consumeToken as unknown as ReturnType<typeof vi.fn>).mockImplementation(
       (token: string) => {
         _consumeCalls.push(token);
         return _tokenStatus;
       },
+    );
+    (qr.qrSession.requiresSignedInner as unknown as ReturnType<typeof vi.fn>).mockImplementation(
+      () => _tokenRequiresSignedInner,
     );
     // Force idle via stop
     const stop = captureHandler("remote-pi stop");
@@ -337,6 +347,64 @@ describe("state machine + pair_request flow", () => {
     expect(_addedPeers[0]).toMatchObject({
       name: "iPhone do Jacob",
       remote_epk: APP_PEER_ID,
+      supports_signed_inner_v1: false,
+    });
+  });
+
+  test("signed-inner capability is persisted and echoed only when requested", async () => {
+    const { generateEd25519Keypair } = await import("./pairing/crypto.js");
+    const APP_PEER_ID = Buffer.from(generateEd25519Keypair().publicKey).toString("base64");
+
+    captureHandler("remote-pi");
+    await _connectForTest(makeMockCtx());
+
+    relayRef.current!.emit("message", makeInnerLine(APP_PEER_ID, {
+      type: "pair_request",
+      id: "req-cap",
+      token: "test-token",
+      device_name: "Capable Phone",
+      capabilities: ["signed_inner_v1"],
+    }));
+
+    await vi.waitFor(() => expect(_getState()).toBe("paired"), { timeout: 2000 });
+
+    expect(_addedPeers[0]).toMatchObject({
+      name: "Capable Phone",
+      remote_epk: APP_PEER_ID,
+      supports_signed_inner_v1: true,
+    });
+    const sent = relayRef.current!.send.mock.calls.map((c) => c[0] as string);
+    const pairOks = sent.map(decodeSentCt).filter((d) => d.inner.type === "pair_ok");
+    expect(pairOks[0]!.inner["capabilities"]).toEqual(["signed_inner_v1"]);
+  });
+
+  test("QR-required signed-inner rejects stripped capability before consuming token", async () => {
+    _tokenRequiresSignedInner = true;
+    const { generateEd25519Keypair } = await import("./pairing/crypto.js");
+    const APP_PEER_ID = Buffer.from(generateEd25519Keypair().publicKey).toString("base64");
+
+    captureHandler("remote-pi");
+    await _connectForTest(makeMockCtx());
+
+    relayRef.current!.emit("message", makeInnerLine(APP_PEER_ID, {
+      type: "pair_request",
+      id: "req-downgrade",
+      token: "test-token",
+      device_name: "Downgraded Phone",
+    }));
+
+    await new Promise((r) => setTimeout(r, 50));
+
+    expect(_getState()).toBe("started");
+    expect(_addedPeers).toHaveLength(0);
+    expect(_consumeCalls).toHaveLength(0);
+    const sent = relayRef.current!.send.mock.calls.map((c) => c[0] as string);
+    const errs = sent.map(decodeSentCt).filter((d) => d.inner.type === "pair_error");
+    expect(errs).toHaveLength(1);
+    expect(errs[0]!.inner).toMatchObject({
+      type: "pair_error",
+      in_reply_to: "req-downgrade",
+      code: "capability_downgrade",
     });
   });
 
@@ -459,6 +527,68 @@ describe("state machine + pair_request flow", () => {
     await vi.waitFor(() => expect(_getState()).toBe("paired"), { timeout: 2000 });
   });
 
+  test("known signed-inner peer reconnect routes only after verification", async () => {
+    const { generateEd25519Keypair } = await import("./pairing/crypto.js");
+    const { SignedInnerReplayCache, signInnerV1, verifyInnerV1 } = await import("./protocol/signed_inner.js");
+    const { roomIdForCwd } = await import("./rooms.js");
+    const app = generateEd25519Keypair();
+    const APP_PEER_ID = Buffer.from(app.publicKey).toString("base64");
+    const piPk = Buffer.from(_piKeypair.publicKey).toString("base64");
+    _knownPeers.push({
+      name: "Signed App",
+      remote_epk: APP_PEER_ID,
+      paired_at: new Date().toISOString(),
+      supports_signed_inner_v1: true,
+    });
+
+    captureHandler("remote-pi");
+    await _connectForTest(makeMockCtx());
+
+    relayRef.current!.emit("message", makeInnerLine(APP_PEER_ID, signInnerV1({
+      payload: { type: "ping", id: "signed-ping" },
+      sender: app,
+      recipientPk: piPk,
+      roomId: roomIdForCwd("/home/user/projects/remote_pi"),
+    })));
+
+    await vi.waitFor(() => expect(_getState()).toBe("paired"), { timeout: 2000 });
+    const sent = relayRef.current!.send.mock.calls.map((c) => c[0] as string);
+    const signedReplies = sent.map(decodeSentCt).filter((d) => d.inner.type === "signed_inner_v1");
+    expect(signedReplies).toHaveLength(1);
+    const verified = verifyInnerV1({
+      frame: signedReplies[0]!.inner as never,
+      expectedSenderPk: piPk,
+      expectedRecipientPk: APP_PEER_ID,
+      expectedRoomId: roomIdForCwd("/home/user/projects/remote_pi"),
+      replay: new SignedInnerReplayCache(),
+    });
+    expect(verified).toMatchObject({ ok: true, payload: { type: "pong", in_reply_to: "signed-ping" } });
+  });
+
+  test("known signed-inner peer reconnect rejects unsigned first message", async () => {
+    const { generateEd25519Keypair } = await import("./pairing/crypto.js");
+    const app = generateEd25519Keypair();
+    const APP_PEER_ID = Buffer.from(app.publicKey).toString("base64");
+    _knownPeers.push({
+      name: "Signed App",
+      remote_epk: APP_PEER_ID,
+      paired_at: new Date().toISOString(),
+      supports_signed_inner_v1: true,
+    });
+
+    captureHandler("remote-pi");
+    await _connectForTest(makeMockCtx());
+
+    relayRef.current!.emit("message", makeInnerLine(APP_PEER_ID, {
+      type: "ping",
+      id: "unsigned-ping",
+    }));
+    await new Promise((r) => setTimeout(r, 50));
+
+    expect(_getState()).toBe("paired");
+    expect(relayRef.current!.send.mock.calls).toHaveLength(0);
+  });
+
   test("unknown peer non-pair message → state stays started, no peer added", async () => {
     captureHandler("remote-pi");
     await _connectForTest(makeMockCtx());
@@ -492,6 +622,41 @@ describe("state machine + pair_request flow", () => {
       type: "error",
       code: "unknown_peer",
     });
+  });
+
+  test("unknown signed peer receives signed unknown_peer error", async () => {
+    const { generateEd25519Keypair } = await import("./pairing/crypto.js");
+    const { SignedInnerReplayCache, signInnerV1, verifyInnerV1 } = await import("./protocol/signed_inner.js");
+    const { roomIdForCwd } = await import("./rooms.js");
+    const app = generateEd25519Keypair();
+    const APP_PEER_ID = Buffer.from(app.publicKey).toString("base64");
+    const piPk = Buffer.from(_piKeypair.publicKey).toString("base64");
+    const roomId = roomIdForCwd("/home/user/projects/remote_pi");
+
+    captureHandler("remote-pi");
+    await _connectForTest(makeMockCtx());
+
+    relayRef.current!.emit("message", makeInnerLine(APP_PEER_ID, signInnerV1({
+      payload: { type: "ping", id: "revoked-signed" },
+      sender: app,
+      recipientPk: piPk,
+      roomId,
+    })));
+    await new Promise((r) => setTimeout(r, 50));
+
+    expect(_getState()).toBe("started");
+    expect(_addedPeers).toHaveLength(0);
+    const sent = relayRef.current!.send.mock.calls.map((c) => c[0] as string);
+    const replies = sent.map(decodeSentCt).filter((d) => d.inner.type === "signed_inner_v1");
+    expect(replies).toHaveLength(1);
+    const verified = verifyInnerV1({
+      frame: replies[0]!.inner as never,
+      expectedSenderPk: piPk,
+      expectedRecipientPk: APP_PEER_ID,
+      expectedRoomId: roomId,
+      replay: new SignedInnerReplayCache(),
+    });
+    expect(verified).toMatchObject({ ok: true, payload: { type: "error", code: "unknown_peer" } });
   });
 
   test("unknown peer + pair_request → NOT replied with error{unknown_peer}", async () => {
@@ -578,7 +743,7 @@ describe("contract fixtures: pair_*", () => {
     const lines = readFileSync(`${fixtureDir}/pair_error.jsonl`, "utf8")
       .split("\n").filter(Boolean);
     expect(lines.length).toBeGreaterThan(0);
-    const validCodes = new Set(["token_expired", "token_consumed", "token_unknown", "internal_error"]);
+    const validCodes = new Set(["token_expired", "token_consumed", "token_unknown", "capability_downgrade", "internal_error"]);
     for (const line of lines) {
       const obj = JSON.parse(line) as { type: string; in_reply_to: string; code: string; message: string };
       expect(obj.type).toBe("pair_error");

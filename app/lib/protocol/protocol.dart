@@ -362,10 +362,12 @@ class PairRequest extends ClientMessage {
   final String id;
   final String token;
   final String deviceName;
+  final List<String> capabilities;
   PairRequest({
     required this.id,
     required this.token,
     required this.deviceName,
+    this.capabilities = const [],
   });
 
   @override
@@ -374,6 +376,7 @@ class PairRequest extends ClientMessage {
     'id': id,
     'token': token,
     'device_name': deviceName,
+    if (capabilities.isNotEmpty) 'capabilities': capabilities,
   };
 }
 
@@ -566,6 +569,8 @@ class PairOk extends ServerMessage {
   /// pre-fill a sensible placeholder ("Mac do Jacob") instead of a
   /// generic "Pi". `null` on legacy Pis.
   final String? hostname;
+  final List<String> capabilities;
+  bool get supportsSignedInnerV1 => capabilities.contains('signed_inner_v1');
   PairOk({
     required this.inReplyTo,
     required this.sessionName,
@@ -573,11 +578,13 @@ class PairOk extends ServerMessage {
     required this.roomId,
     this.harness,
     this.hostname,
+    this.capabilities = const [],
   });
 
   factory PairOk.fromJson(Map<String, dynamic> j) {
     final harnessJson = j['harness'];
     final hostname = j['hostname'];
+    final capabilitiesJson = j['capabilities'];
     final startedAt = j['session_started_at'];
     return PairOk(
       inReplyTo: j['in_reply_to'] as String,
@@ -594,6 +601,9 @@ class PairOk extends ServerMessage {
           ? PiHarness.fromJson(harnessJson)
           : null,
       hostname: hostname is String && hostname.isNotEmpty ? hostname : null,
+      capabilities: capabilitiesJson is List
+          ? capabilitiesJson.whereType<String>().toList(growable: false)
+          : const [],
     );
   }
 }

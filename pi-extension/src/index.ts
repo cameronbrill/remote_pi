@@ -57,6 +57,12 @@ import type {
 } from "./protocol/types.js";
 import { RelayClient, RoomAlreadyOpenError } from "./transport/relay_client.js";
 import { PlainPeerChannel } from "./transport/peer_channel.js";
+import {
+  isSignedInnerV1,
+  signInnerV1,
+  SignedInnerReplayCache,
+  type SignedInnerV1,
+} from "./protocol/signed_inner.js";
 import { roomIdForCwd } from "./rooms.js";
 import { SessionPeer } from "./session/peer.js";
 import { registerAgentTools } from "./session/tools.js";
@@ -129,6 +135,7 @@ let _relayUrl: string | null = null;  // URL used by current _relay connection
  *     `/remote-pi status` output both derive from this.
  */
 const _activePeers = new Map<string, PlainPeerChannel>();
+const _signedReplayCaches = new Map<string, SignedInnerReplayCache>();
 let _peerShort = "";  // shortid of the most recently attached peer (UX hint only)
 
 let _myRoomId: string | null = null;   // this Pi's room id (derived from cwd)
@@ -705,16 +712,39 @@ export function _onPeerDisconnect(appPeerId?: string): void {
  * channel and installs a fresh one — covers reconnect from the same
  * device without leaking listeners).
  */
+function _isCanonicalBase64Ed25519Key(value: string): boolean {
+  try {
+    const bytes = Buffer.from(value, "base64");
+    return bytes.length === 32 && bytes.toString("base64") === value;
+  } catch {
+    return false;
+  }
+}
+
+function _signedReplayCacheFor(appPeerId: string, roomId: string): SignedInnerReplayCache {
+  const key = `${appPeerId}\u0000${roomId}`;
+  let cache = _signedReplayCaches.get(key);
+  if (!cache) {
+    cache = new SignedInnerReplayCache();
+    _signedReplayCaches.set(key, cache);
+  }
+  return cache;
+}
+
 function _attachOwner(
   relay: RelayClient,
   appPeerId: string,
   peerName: string,
-  firstInner?: ClientMessage,
+  supportsSignedInnerV1 = false,
 ): PlainPeerChannel {
   const peerShort = appPeerId.slice(0, 8);
 
   // Drop any stale channel for this owner before re-attaching.
   if (_activePeers.has(appPeerId)) _detachPeerChannel(appPeerId);
+
+  if (supportsSignedInnerV1 && (!_cachedEd25519 || !_myRoomId || !_isCanonicalBase64Ed25519Key(appPeerId))) {
+    throw new Error("signed_inner_v1 was negotiated but channel signing prerequisites are unavailable");
+  }
 
   const channel = new PlainPeerChannel(
     relay,
@@ -722,6 +752,15 @@ function _attachOwner(
     _myRoomId ?? undefined,
     (msg) => _routeClientMessageFrom(channel, msg, _lastCtx ?? _noopCtx),
     () => _onPeerDisconnect(appPeerId),
+    supportsSignedInnerV1
+      ? {
+          localKeypair: _cachedEd25519!,
+          expectedRemotePubkey: appPeerId,
+          roomId: _myRoomId!,
+          requireSigned: true,
+          replayCache: _signedReplayCacheFor(appPeerId, _myRoomId!),
+        }
+      : undefined,
   );
 
   _attachPeerChannel(appPeerId, channel);
@@ -733,12 +772,6 @@ function _attachOwner(
     "info",
   );
 
-  if (firstInner) {
-    // The PlainPeerChannel listener fired on the same line that triggered
-    // attachment in some flows; we route explicitly here too to ensure the
-    // inner reaches the handler exactly once.
-    void firstInner;
-  }
   return channel;
 }
 
@@ -768,7 +801,7 @@ function _installAutoListener(relay: RelayClient): () => void {
     if (_activePeers.has(outer.peer)) return;
 
     // Decode inner envelope (base64 JSON)
-    let inner: ClientMessage;
+    let inner: ClientMessage | SignedInnerV1;
     try {
       const plaintext = Buffer.from(outer.ct, "base64").toString("utf8");
       const parsed = JSON.parse(plaintext) as unknown;
@@ -777,7 +810,7 @@ function _installAutoListener(relay: RelayClient): () => void {
         typeof parsed !== "object" ||
         typeof (parsed as Record<string, unknown>).type !== "string"
       ) return;
-      inner = parsed as ClientMessage;
+      inner = parsed as ClientMessage | SignedInnerV1;
     } catch { return; }
 
     const appPeerId = outer.peer;
@@ -791,12 +824,23 @@ function _installAutoListener(relay: RelayClient): () => void {
     // sends a non-pair message → attach + route through the new channel.
     // See pairing.md §Reconexão.
     const known = await _findKnownPeer(appPeerId);
+    const existing = _activePeers.get(appPeerId);
+    if (existing) {
+      existing.acceptRelayLine(line);
+      return;
+    }
     if (known) {
-      const channel = _attachOwner(relay, appPeerId, known.name);
+      let channel: PlainPeerChannel;
+      try {
+        channel = _attachOwner(relay, appPeerId, known.name, known.supports_signed_inner_v1 === true);
+      } catch {
+        return;
+      }
       // The PlainPeerChannel listener for this owner won't have seen the
-      // line that triggered the attach (we already consumed it); route
-      // it explicitly via the new channel so the sender gets a reply.
-      _routeClientMessageFrom(channel, inner, _lastCtx ?? _noopCtx);
+      // line that triggered the attach (we already consumed it); feed the
+      // original relay line through the channel so signed_inner_v1
+      // verification/replay checks are applied before routing.
+      channel.acceptRelayLine(line);
       return;
     }
 
@@ -809,7 +853,15 @@ function _installAutoListener(relay: RelayClient): () => void {
       code: "unknown_peer",
       message: "Peer not paired — re-scan QR",
     };
-    const errCt = Buffer.from(JSON.stringify(errReply)).toString("base64");
+    const errInner = isSignedInnerV1(inner) && _cachedEd25519 && _myRoomId && _isCanonicalBase64Ed25519Key(appPeerId)
+      ? signInnerV1({
+          payload: errReply as Record<string, unknown>,
+          sender: _cachedEd25519,
+          recipientPk: appPeerId,
+          roomId: typeof inner.room_id === "string" ? inner.room_id : _myRoomId,
+        })
+      : errReply;
+    const errCt = Buffer.from(JSON.stringify(errInner)).toString("base64");
     relay.send(JSON.stringify({ peer: appPeerId, ct: errCt }));
   };
 
@@ -855,6 +907,12 @@ async function _handlePairRequest(
     sendInner({ type: "pair_error", in_reply_to: inner.id, code, message });
   };
 
+  const supportsSignedInnerV1 = Array.isArray(inner.capabilities) && inner.capabilities.includes("signed_inner_v1");
+  if (qrSession.requiresSignedInner(inner.token) && !supportsSignedInnerV1) {
+    sendError("capability_downgrade", "Signed inner-message support was advertised in the QR but not requested by the app.");
+    return;
+  }
+
   const status = qrSession.consumeToken(inner.token);
   if (status !== "ok") {
     const code: PairErrorCode =
@@ -869,11 +927,17 @@ async function _handlePairRequest(
     return;
   }
 
+  if (supportsSignedInnerV1 && (!_cachedEd25519 || !_myRoomId || !_isCanonicalBase64Ed25519Key(appPeerId))) {
+    sendError("internal_error", "signed_inner_v1 was negotiated but channel signing prerequisites are unavailable.");
+    return;
+  }
+
   try {
     await addPeer({
       name: inner.device_name,
       remote_epk: appPeerId,
       paired_at: new Date().toISOString(),
+      supports_signed_inner_v1: supportsSignedInnerV1,
     });
     _refreshPairingsCache();
   } catch (err) {
@@ -889,8 +953,11 @@ async function _handlePairRequest(
   // in the terminal title and in /remote-pi status.
   const sessionName = _displayName(cwd);
 
-  _attachOwner(relay, appPeerId, inner.device_name);
+  _attachOwner(relay, appPeerId, inner.device_name, supportsSignedInnerV1);
 
+  // Pairing bootstrap remains unsigned: signed_inner_v1 is negotiated in this
+  // pair_ok and enforced only for subsequent paired traffic. Pair-token
+  // hardening is handled separately by owner-signed pairing.
   sendInner({
     type: "pair_ok",
     in_reply_to: inner.id,
@@ -906,6 +973,7 @@ async function _handlePairRequest(
     // two PCs apart even when nicknames collide).
     harness: _HARNESS,
     hostname: _HOSTNAME,
+    ...(supportsSignedInnerV1 ? { capabilities: ["signed_inner_v1"] } : {}),
   });
 }
 

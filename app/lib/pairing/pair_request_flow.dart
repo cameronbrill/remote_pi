@@ -12,7 +12,7 @@ import 'dart:convert';
 import 'dart:typed_data';
 
 import 'package:app/data/transport/relay_config.dart';
-import 'package:app/protocol/protocol.dart' show PairOk;
+import 'package:app/protocol/protocol.dart' show PairOk, PairRequest;
 import 'package:app/protocol/uuid7.dart';
 
 import 'qr_scanner.dart';
@@ -103,13 +103,13 @@ Future<PairingResult> performPairing({
   }
 
   final id = uuid7();
-  final req = {
-    'type': 'pair_request',
-    'id': id,
-    'token': qr.token,
-    'device_name': deviceName,
-  };
-  await transport.send(Uint8List.fromList(utf8.encode(jsonEncode(req))));
+  final req = PairRequest(
+    id: id,
+    token: qr.token,
+    deviceName: deviceName,
+    capabilities: const ['signed_inner_v1'],
+  );
+  await transport.send(Uint8List.fromList(utf8.encode(jsonEncode(req.toJson()))));
 
   final raw = await transport.receive();
   final inner = jsonDecode(utf8.decode(raw)) as Map<String, dynamic>;
@@ -133,6 +133,16 @@ Future<PairingResult> performPairing({
     final piRoomId = piEchoedRoom
         ? pairOk.roomId
         : (qr.roomId ?? 'main');
+    // signed_inner_v1 starts after pair_ok. The pair_ok itself is bootstrap
+    // traffic so old Pis/apps can still pair; only persist strict mode when
+    // the Pi explicitly echoes the capability.
+    if (qr.signedInnerRequired && !pairOk.supportsSignedInnerV1) {
+      throw PairingError(
+        code: 'capability_downgrade',
+        message: 'Signed inner-message support was advertised in the QR but not confirmed by the Pi.',
+      );
+    }
+
     final peer = PeerRecord(
       remoteEpk: qr.epk,
       sessionName: pairOk.sessionName,
@@ -145,6 +155,7 @@ Future<PairingResult> performPairing({
       // Plan/27 Wave A — null when pi-extension hasn't been upgraded
       // yet to publish `harness` in pair_ok.
       harness: pairOk.harness,
+      supportsSignedInnerV1: pairOk.supportsSignedInnerV1,
     );
     await storage.savePeer(peer);
     return PairingResult(peer: peer, hostnameHint: pairOk.hostname);
